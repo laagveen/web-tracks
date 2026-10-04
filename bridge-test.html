@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI Bridge Test</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; --line: #deded8;
+    --accent: #2f6fd6; --ok: #2e8b57; --warn: #b5651d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141413; --fg: #ececea; --muted: #9a9a94; --card: #1f1f1d; --line: #33332f;
+      --accent: #6e9ff0; --ok: #5cbf86; --warn: #e09a55; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.45 -apple-system, system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 0 0 8px; }
+  p { margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; margin: 14px 0; }
+  label { display: inline-flex; gap: 6px; align-items: center; margin: 0 14px 8px 0; }
+  select, input, button { font: inherit; }
+  select, input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--bg); color: var(--fg); }
+  input[type=number] { width: 6em; }
+  label, select { max-width: 100%; }
+  label { flex-wrap: wrap; }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent);
+    color: #fff; margin: 4px 8px 4px 0; min-height: 44px; }
+  button.secondary { background: var(--line); color: var(--fg); }
+  button:disabled { opacity: .5; }
+  pre { white-space: pre-wrap; word-break: break-word; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 10px; margin: 8px 0 0;
+    font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  a { color: var(--accent); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); }
+  ol { margin: 0 0 10px; padding-left: 1.3em; }
+</style>
+</head>
+<body>
+<main>
+  <p><a href="./">← Back to web-tracks</a></p>
+  <h1>MIDI Bridge Test</h1>
+  <p class="muted">Finds out how this browser delivers timestamped MIDI: natively on time, or on
+    JavaScript timers that wait for the page's main thread. Open it in the same app you use for
+    web-tracks.</p>
+
+  <section>
+    <h2>1 · Environment</h2>
+    <label>Output <select id="out"></select></label>
+    <label>Channel <select id="ch"></select></label>
+    <button class="secondary" id="ping">Send one note</button>
+    <pre id="env">Requesting MIDI access…</pre>
+  </section>
+
+  <section>
+    <h2>2 · Block test (listen)</h2>
+    <p>Schedules 16 sixteenth notes at 120 BPM, starting 0.5 s from now, all sent at once with
+      timestamps. Then it freezes the page's main thread on purpose.</p>
+    <ol>
+      <li><b>Steady run</b> of 16 notes: delivery is timestamp-driven and independent of the page.</li>
+      <li><b>Silence, then a burst</b> of notes at the end of the freeze: delivery waits for the main
+        thread (JavaScript timers), so page work delays notes.</li>
+    </ol>
+    <label>Freeze for <input id="blockMs" type="number" value="1500" min="0" step="100"> ms</label>
+    <br>
+    <button id="blockRun">Run with freeze</button>
+    <button class="secondary" id="blockCtrl">Control run (no freeze)</button>
+    <pre id="blockLog">Not run yet.</pre>
+  </section>
+
+  <section>
+    <h2>3 · Load test (record into Logic)</h2>
+    <p>Plays steady sixteenth notes the way web-tracks does: a Web Worker ticks every 25 ms and the
+      page schedules 120 ms ahead with timestamps. Switch the main-thread load while it runs; each
+      load uses its own pitch, so a recording separates them.</p>
+    <label>Tempo <input id="bpm" type="number" value="120" min="40" max="240"> BPM</label>
+    <label>Load <select id="load">
+      <option value="idle">Idle · C4 (60)</option>
+      <option value="busy">Busy: 20 ms work every 40 ms · D4 (62)</option>
+      <option value="heavy">Heavy: 40 ms work every 60 ms · E4 (64)</option>
+    </select></label>
+    <br>
+    <button id="loadStart">Start</button>
+    <button class="secondary" id="loadStop" disabled>Stop</button>
+    <pre id="loadLog">Record about 1 minute per load setting into Logic at the same tempo, then
+export the region as a .mid file.</pre>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id)
+  const outSel = $('out'), chSel = $('ch')
+  for (let c = 1; c <= 16; c++) chSel.add(new Option(String(c), String(c - 1)))
+  let access = null
+
+  const isNative = (fn) => typeof fn === 'function' && /\[native code\]/.test(Function.prototype.toString.call(fn))
+  const output = () => access && access.outputs.get(outSel.value)
+  const ch = () => Number(chSel.value)
+  const now = () => performance.now()
+
+  const noteAt = (o, pitch, vel, at, lenMs) => {
+    o.send([0x90 | ch(), pitch, vel], at)
+    o.send([0x80 | ch(), pitch, 0], at + lenMs)
+  }
+  const busyWait = (ms) => { const end = now() + ms; while (now() < end) { /* block the main thread */ } }
+
+  async function init() {
+    const env = $('env')
+    const lines = [
+      `User agent: ${navigator.userAgent}`,
+      `requestMIDIAccess: ${typeof navigator.requestMIDIAccess === 'function'
+        ? (isNative(navigator.requestMIDIAccess) ? 'native' : 'provided by script (bridge/polyfill)')
+        : 'missing'}`,
+    ]
+    if (typeof navigator.requestMIDIAccess !== 'function') { env.textContent = lines.join('\n'); return }
+    try {
+      access = await navigator.requestMIDIAccess({ sysex: false })
+    } catch (e) {
+      lines.push(`MIDI access refused: ${e}`); env.textContent = lines.join('\n'); return
+    }
+    const fill = () => {
+      const keep = outSel.value
+      outSel.innerHTML = ''
+      for (const o of access.outputs.values()) outSel.add(new Option(o.name || `(unnamed ${o.id})`, o.id))
+      if ([...outSel.options].some((op) => op.value === keep)) outSel.value = keep
+      const first = access.outputs.values().next().value
+      const send = first && first.send
+      env.textContent = [...lines,
+        `MIDIOutput.send: ${send ? (isNative(send) ? 'native' : 'provided by script (bridge/polyfill)') : 'no output yet'}`,
+        `Outputs: ${[...access.outputs.values()].map((o) => o.name || o.id).join(', ') || 'none'}`,
+      ].join('\n')
+    }
+    fill()
+    access.onstatechange = fill
+  }
+
+  $('ping').onclick = () => { const o = output(); if (o) noteAt(o, 72, 100, now() + 20, 150) }
+
+  // Block test: every note is handed over with its timestamp before the freeze starts.
+  function blockTest(freeze) {
+    const o = output(); if (!o) { $('blockLog').textContent = 'Pick an output first.'; return }
+    const blockMs = freeze ? Math.max(0, Number($('blockMs').value) || 0) : 0
+    const step = 125, start = now() + 500
+    for (let i = 0; i < 16; i++) noteAt(o, i % 4 === 0 ? 72 : 67, i % 4 === 0 ? 110 : 80, start + i * step, 60)
+    const t0 = now()
+    busyWait(blockMs)
+    const blocked = now() - t0
+    const lastAt = 500 + 15 * step
+    const dueDuring = Math.max(0, Math.min(16, Math.ceil((blocked - 500) / step)))
+    $('blockLog').textContent = [
+      freeze ? `Froze the main thread for ${blocked.toFixed(0)} ms right after sending.` : 'No freeze (control run).',
+      'Notes due at 500 ms … ' + lastAt + ' ms after the click, every 125 ms (accent every 4th).',
+      freeze ? `${dueDuring} of 16 notes fell inside the freeze.` : '',
+      freeze ? 'Steady run = native timestamps. Silence then a burst = main-thread timers.' : 'This is the reference rhythm.',
+    ].filter(Boolean).join('\n')
+  }
+  $('blockRun').onclick = () => blockTest(true)
+  $('blockCtrl').onclick = () => blockTest(false)
+
+  // Load test: worker tick + lookahead, like the app's scheduler.
+  const LOAD = {
+    idle: { pitch: 60, workMs: 0, everyMs: 0 },
+    busy: { pitch: 62, workMs: 20, everyMs: 40 },
+    heavy: { pitch: 64, workMs: 40, everyMs: 60 },
+  }
+  const TICK_MS = 25, LOOKAHEAD_MS = 120
+  let worker = null, loadTimer = null, nextAt = 0, stepIdx = 0, startedAt = 0, stats = null
+
+  const workerSrc = `let t=null;onmessage=(e)=>{clearInterval(t);if(e.data>0)t=setInterval(()=>postMessage(0),e.data)}`
+
+  function applyLoad() {
+    clearInterval(loadTimer); loadTimer = null
+    const l = LOAD[$('load').value]
+    if (l.workMs > 0) loadTimer = setInterval(() => busyWait(l.workMs), l.everyMs)
+  }
+
+  function schedule() {
+    const o = output(); if (!o) return
+    const t = now()
+    stats.ticks++
+    const gap = t - stats.lastTick
+    if (stats.lastTick && gap > stats.maxGap) stats.maxGap = gap
+    stats.lastTick = t
+    const stepMs = 60000 / (Number($('bpm').value) || 120) / 4
+    const pitch = LOAD[$('load').value].pitch
+    if (nextAt < t) { stats.late++; }
+    while (nextAt < t + LOOKAHEAD_MS) {
+      noteAt(o, pitch, stepIdx % 4 === 0 ? 110 : 80, Math.max(nextAt, t), stepMs * 0.5)
+      nextAt += stepMs; stepIdx++
+    }
+  }
+
+  function report(extra) {
+    const elapsed = (now() - startedAt) / 1000
+    $('loadLog').textContent = [
+      `Running ${elapsed.toFixed(0)} s · load ${$('load').value} · ${stepIdx} notes scheduled`,
+      `Longest gap between ticks: ${stats.maxGap.toFixed(0)} ms (tick every ${TICK_MS} ms, lookahead ${LOOKAHEAD_MS} ms)`,
+      stats.late ? `Ticks that arrived after a note was due: ${stats.late} (the page itself fell behind)` : 'The page never fell behind its own schedule.',
+      ...stats.log,
+      extra || '',
+    ].filter(Boolean).join('\n')
+  }
+
+  $('load').onchange = () => {
+    if (!worker) return
+    applyLoad()
+    stats.log.push(`${((now() - startedAt) / 1000).toFixed(1)} s: switched to ${$('load').value}`)
+  }
+
+  $('loadStart').onclick = () => {
+    if (!output()) { $('loadLog').textContent = 'Pick an output first.'; return }
+    worker = new Worker(URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' })))
+    stats = { ticks: 0, lastTick: 0, maxGap: 0, late: 0, log: [] }
+    startedAt = now(); nextAt = startedAt + 100; stepIdx = 0
+    worker.onmessage = () => { schedule(); if (stats.ticks % 40 === 0) report() }
+    worker.postMessage(TICK_MS)
+    applyLoad()
+    stats.log.push(`0.0 s: started with ${$('load').value}`)
+    $('loadStart').disabled = true; $('loadStop').disabled = false
+  }
+
+  $('loadStop').onclick = () => {
+    worker && worker.terminate(); worker = null
+    clearInterval(loadTimer); loadTimer = null
+    report('Stopped. Export the Logic region as .mid for analysis.')
+    $('loadStart').disabled = false; $('loadStop').disabled = true
+  }
+
+  init()
+})()
+</script>
+</body>
+</html>
